@@ -12,3 +12,5 @@
 ## Лабораторна робота №1
 
 ```python img_viewer/main.py```
+
+![GUI screenshot](images/lab-1-screenshot.png)
