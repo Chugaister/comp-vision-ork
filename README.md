@@ -22,6 +22,13 @@ Windows
 
 Run program with command
 
-```python img_viewer/main.py```
+```python lab1/main.py```
 
 ![GUI screenshot](images/lab-1-screenshot.png)
+
+
+## Лабораторна робота №2
+
+Run program with command
+
+```python lab2/main.py```
