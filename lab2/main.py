@@ -1,6 +1,7 @@
 """
 Image Processing — Filtering & Segmentation
 Minimal PyQt5 GUI with system-native look. Processing in processing.py.
+Heavy operations run in a background QThread to keep the UI responsive.
 """
 
 import sys
@@ -11,10 +12,32 @@ from PyQt5.QtWidgets import (
     QComboBox, QSpinBox, QMessageBox, QSplitter, QSizePolicy,
 )
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import numpy as np
 
 import image_processing as proc
 
+
+# ── Worker thread ───────────────────────────────────────────────────────────
+
+class Worker(QThread):
+    """Runs a callable in a background thread and emits the result."""
+    finished = pyqtSignal(object)  # emits the result image (ndarray or None)
+    error = pyqtSignal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def cv2pix(img, max_w, max_h):
     if img is None:
@@ -53,6 +76,8 @@ class ImgLabel(QLabel):
         self._repaint()
 
 
+# ── Main Window ─────────────────────────────────────────────────────────────
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -60,6 +85,7 @@ class MainWindow(QMainWindow):
         self.resize(960, 600)
         self.src = None
         self.dst = None
+        self._worker = None
         self._build()
 
     def _build(self):
@@ -130,15 +156,15 @@ class MainWindow(QMainWindow):
             self._g2l.addWidget(w)
             return w, s
 
-        self.w_ksize, self.sp_ksize           = _sp("Kernel", 1, 51, 5, 2)
-        self.w_sigma, self.sp_sigma           = _sp("Sigma", 0, 100, 1)
-        self.w_d, self.sp_d                   = _sp("Diameter", 1, 25, 9)
-        self.w_sc, self.sp_sc                 = _sp("σ Color", 1, 300, 75)
-        self.w_ss, self.sp_ss                 = _sp("σ Space", 1, 300, 75)
-        self.w_amt, self.sp_amt               = _sp("Amount %", 1, 500, 150)
-        self.w_rad, self.sp_rad               = _sp("Radius", 1, 51, 5, 2)
-        self.w_thresh, self.sl_thresh         = _sl("Threshold", 0, 255, 127)
-        self.w_gciter, self.sp_gciter         = _sp("Iterations", 1, 20, 5)
+        self.w_ksize, self.sp_ksize   = _sp("Kernel", 1, 51, 5, 2)
+        self.w_sigma, self.sp_sigma   = _sp("Sigma", 0, 100, 1)
+        self.w_d, self.sp_d           = _sp("Diameter", 1, 25, 9)
+        self.w_sc, self.sp_sc         = _sp("σ Color", 1, 300, 75)
+        self.w_ss, self.sp_ss         = _sp("σ Space", 1, 300, 75)
+        self.w_amt, self.sp_amt       = _sp("Amount %", 1, 500, 150)
+        self.w_rad, self.sp_rad       = _sp("Radius", 1, 51, 5, 2)
+        self.w_thresh, self.sl_thresh = _sl("Threshold", 0, 255, 127)
+        self.w_gciter, self.sp_gciter = _sp("Iterations", 1, 20, 5)
 
         self._param_map = {
             0: [self.w_ksize, self.w_sigma],
@@ -157,9 +183,9 @@ class MainWindow(QMainWindow):
         ]
         lv.addWidget(g2)
 
-        b_apply = QPushButton("Apply")
-        b_apply.clicked.connect(self._apply)
-        lv.addWidget(b_apply)
+        self.b_apply = QPushButton("Apply")
+        self.b_apply.clicked.connect(self._apply)
+        lv.addWidget(self.b_apply)
         lv.addStretch()
 
         root.addWidget(left)
@@ -184,7 +210,10 @@ class MainWindow(QMainWindow):
     # ── I/O ──
 
     def _open(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Open", "", "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.webp)")
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Open", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.webp)"
+        )
         if not p:
             return
         img = proc.load_image(p, max_dim=1600)
@@ -200,42 +229,87 @@ class MainWindow(QMainWindow):
     def _save(self):
         if self.dst is None:
             return
-        p, _ = QFileDialog.getSaveFileName(self, "Save", "result.png", "PNG (*.png);;JPEG (*.jpg)")
+        p, _ = QFileDialog.getSaveFileName(
+            self, "Save", "result.png",
+            "PNG (*.png);;JPEG (*.jpg)"
+        )
         if p:
             cv2.imwrite(p, self.dst)
 
-    # ── Apply ──
+    # ── UI lock/unlock during processing ──
+
+    def _set_busy(self, busy):
+        self.b_apply.setEnabled(not busy)
+        self.b_apply.setText("Processing…" if busy else "Apply")
+        self.cmb.setEnabled(not busy)
+
+    # ── Apply (runs processing in a worker thread) ──
 
     def _apply(self):
         if self.src is None:
             QMessageBox.information(self, "", "Open an image first.")
             return
+        if self._worker is not None and self._worker.isRunning():
+            return
+
         img = self.src.copy()
         i = self.cmb.currentIndex()
 
-        if i == 0:
-            r = proc.gaussian_blur(img, self.sp_ksize.value(), self.sp_sigma.value())
-        elif i == 1:
-            r = proc.median_blur(img, self.sp_ksize.value())
-        elif i == 2:
-            r = proc.bilateral_filter(img, self.sp_d.value(), self.sp_sc.value(), self.sp_ss.value())
-        elif i == 3:
-            r = proc.sharpen_unsharp_mask(img, self.sp_amt.value() / 100, self.sp_rad.value(), self.sp_sigma.value())
-        elif i == 4:
-            r = proc.sharpen_laplacian(img)
-        elif i == 5:
-            r = proc.threshold_binary(img, self.sl_thresh.value())
-        elif i == 6:
-            r, _ = proc.threshold_otsu(img)
-        elif i == 7:
-            r, _ = proc.watershed_segmentation(img)
-        elif i == 8:
-            r, _ = proc.grabcut_segmentation(img, self.sp_gciter.value())
-        else:
-            return
+        # Capture current parameter values (must read from GUI in main thread)
+        ksize = self.sp_ksize.value()
+        sigma = self.sp_sigma.value()
+        d = self.sp_d.value()
+        sc = self.sp_sc.value()
+        ss = self.sp_ss.value()
+        amt = self.sp_amt.value() / 100.0
+        rad = self.sp_rad.value()
+        thresh = self.sl_thresh.value()
+        gciter = self.sp_gciter.value()
 
-        self.dst = r
-        self.lbl_dst.set_image(r)
+        # Build the processing callable
+        def task():
+            if i == 0:
+                return proc.gaussian_blur(img, ksize, sigma)
+            elif i == 1:
+                return proc.median_blur(img, ksize)
+            elif i == 2:
+                return proc.bilateral_filter(img, d, sc, ss)
+            elif i == 3:
+                return proc.sharpen_unsharp_mask(img, amt, rad, sigma)
+            elif i == 4:
+                return proc.sharpen_laplacian(img)
+            elif i == 5:
+                return proc.threshold_binary(img, thresh)
+            elif i == 6:
+                r, _ = proc.threshold_otsu(img)
+                return r
+            elif i == 7:
+                r, _ = proc.watershed_segmentation(img)
+                return r
+            elif i == 8:
+                r, _ = proc.grabcut_segmentation(img, gciter)
+                return r
+
+        self._set_busy(True)
+        self.lbl_dst.setText("Processing…")
+
+        self._worker = Worker(task)
+        self._worker.finished.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _on_done(self, result):
+        self._set_busy(False)
+        if result is not None:
+            self.dst = result
+            self.lbl_dst.set_image(result)
+        self._worker = None
+
+    def _on_error(self, msg):
+        self._set_busy(False)
+        self.lbl_dst.setText("Result")
+        QMessageBox.warning(self, "Error", msg)
+        self._worker = None
 
 
 def main():
