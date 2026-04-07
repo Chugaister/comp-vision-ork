@@ -32,3 +32,10 @@ Run program with command
 Run program with command
 
 ```python lab2/main.py```
+
+
+## Лабораторна робота №3
+
+Run program with command
+
+```python lab3/main.py```
